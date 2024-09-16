@@ -1,29 +1,43 @@
 use core::ops::{Add, AddAssign, Div, DivAssign, Mul, MulAssign, Sub, SubAssign};
 
+pub trait RGB {
+    fn to_rgb_packed(&self) -> &u32;
+    fn to_rgb(&self) -> [u8; 3];
+}
+
 #[repr(packed)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Pixel {
     r: u8,
     g: u8,
     b: u8,
-    _a: u8,
+    _blank: u8,
+}
+
+impl RGB for Pixel {
+    fn to_rgb_packed(&self) -> &u32 {
+        unsafe { core::mem::transmute::<&Self, &u32>(self) }
+    }
+
+    fn to_rgb(&self) -> [u8; 3] {
+        [self.r, self.g, self.b]
+    }
 }
 
 impl Pixel {
-    pub const WHITE: Self = Pixel::new(255, 255, 255);
-
-    pub const BLACK: Self = Pixel::new(0, 0, 0);
+    pub const WHITE: Self = Pixel::splat(u8::MAX);
+    pub const BLACK: Self = Pixel::splat(0);
 
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
-        Pixel { r, g, b, _a: 0 }
+        Pixel { r, g, b, _blank: 0 }
     }
 
-    pub const fn splat(byte: u8) -> Self {
+    pub const fn splat(value: u8) -> Self {
         Pixel {
-            r: byte,
-            g: byte,
-            b: byte,
-            _a: 0,
+            r: value,
+            g: value,
+            b: value,
+            _blank: 0,
         }
     }
 
@@ -31,8 +45,8 @@ impl Pixel {
         let Pixel { r, g, b, .. } = self;
 
         #[inline]
-        fn apply(byte: u8, brightness: f32) -> u8 {
-            ((byte as f32) * brightness) as u8
+        fn apply(value: u8, brightness: f32) -> u8 {
+            ((value as f32) * brightness) as u8
         }
 
         self.r = apply(r, brightness);
@@ -47,12 +61,10 @@ impl Add<Pixel> for Pixel {
     type Output = Pixel;
 
     fn add(self, rhs: Pixel) -> Self::Output {
-        let Pixel { r, g, b, .. } = self;
-
         Pixel::new(
-            r.saturating_add(rhs.r),
-            g.saturating_add(rhs.g),
-            b.saturating_add(rhs.b),
+            self.r.saturating_add(rhs.r),
+            self.g.saturating_add(rhs.g),
+            self.b.saturating_add(rhs.b),
         )
     }
 }
@@ -61,12 +73,10 @@ impl Sub<Pixel> for Pixel {
     type Output = Pixel;
 
     fn sub(self, rhs: Pixel) -> Pixel {
-        let Pixel { r, g, b, .. } = self;
-
         Pixel::new(
-            r.saturating_sub(rhs.r),
-            g.saturating_sub(rhs.g),
-            b.saturating_sub(rhs.b),
+            self.r.saturating_sub(rhs.r),
+            self.g.saturating_sub(rhs.g),
+            self.b.saturating_sub(rhs.b),
         )
     }
 }
@@ -75,12 +85,10 @@ impl Mul<Pixel> for Pixel {
     type Output = Self;
 
     fn mul(self, rhs: Pixel) -> Self::Output {
-        let Pixel { r, g, b, .. } = self;
-
         Pixel::new(
-            r.saturating_mul(rhs.r),
-            g.saturating_mul(rhs.g),
-            b.saturating_mul(rhs.b),
+            self.r.saturating_mul(rhs.r),
+            self.g.saturating_mul(rhs.g),
+            self.b.saturating_mul(rhs.b),
         )
     }
 }
@@ -89,52 +97,42 @@ impl Div<Pixel> for Pixel {
     type Output = Self;
 
     fn div(self, rhs: Pixel) -> Self::Output {
-        let Pixel { r, g, b, .. } = self;
-
         Pixel::new(
-            r.saturating_div(rhs.r),
-            g.saturating_div(rhs.g),
-            b.saturating_div(rhs.b),
+            self.r.saturating_div(rhs.r),
+            self.g.saturating_div(rhs.g),
+            self.b.saturating_div(rhs.b),
         )
     }
 }
 
 impl AddAssign for Pixel {
     fn add_assign(&mut self, rhs: Self) {
-        let Pixel { r, g, b, .. } = rhs;
-
-        self.r += r;
-        self.g += g;
-        self.b += b;
+        self.r = self.r.saturating_add(rhs.r);
+        self.g = self.g.saturating_add(rhs.g);
+        self.b = self.b.saturating_add(rhs.b);
     }
 }
 
 impl SubAssign for Pixel {
     fn sub_assign(&mut self, rhs: Self) {
-        let Pixel { r, g, b, .. } = rhs;
-
-        self.r -= r;
-        self.g -= g;
-        self.b -= b;
+        self.r = self.r.saturating_sub(rhs.r);
+        self.g = self.g.saturating_sub(rhs.g);
+        self.b = self.b.saturating_sub(rhs.b);
     }
 }
 
 impl MulAssign for Pixel {
     fn mul_assign(&mut self, rhs: Self) {
-        let Pixel { r, g, b, .. } = rhs;
-
-        self.r *= r;
-        self.g *= g;
-        self.b *= b;
+        self.r = self.r.saturating_mul(rhs.r);
+        self.g = self.g.saturating_mul(rhs.g);
+        self.b = self.b.saturating_mul(rhs.b);
     }
 }
 
 impl DivAssign for Pixel {
     fn div_assign(&mut self, rhs: Self) {
-        let Pixel { r, g, b, .. } = rhs;
-
-        self.r /= r;
-        self.g /= g;
-        self.b /= b;
+        self.r = self.r.saturating_div(rhs.r);
+        self.g = self.g.saturating_div(rhs.g);
+        self.b = self.b.saturating_div(rhs.b);
     }
 }
