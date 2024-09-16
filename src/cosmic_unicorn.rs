@@ -7,6 +7,7 @@ use hal::dma::double_buffer;
 use hal::pac::interrupt;
 use hal::pio::{Buffers, PinDir, Tx};
 use rp_pico::hal;
+use rp_pico::hal::dma::SingleChannel;
 use rp_pico::pac::PIO0;
 
 use hal::dma::{
@@ -193,6 +194,7 @@ impl CosmicUnicorn {
         unsafe {
             TRANSFER_HANDLER = Some(transfer);
             BUFFERS = Some((bitstream, tx_buf));
+            rp_pico::pac::NVIC::unmask(rp_pico::pac::Interrupt::DMA_IRQ_0);
         }
 
         Self
