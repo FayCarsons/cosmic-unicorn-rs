@@ -5,7 +5,6 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use cortex_m::asm;
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -25,6 +24,8 @@ mod constants;
 mod cosmic_unicorn;
 mod framebuffer;
 mod pixel;
+
+use cosmic_unicorn::CosmicUnicorn;
 
 #[entry]
 fn main() -> ! {
@@ -68,7 +69,5 @@ fn main() -> ! {
 
     let cosmic_unicorn = CosmicUnicorn::new(builder);
 
-    loop {
-        asm::nop()
-    }
+    loop {}
 }

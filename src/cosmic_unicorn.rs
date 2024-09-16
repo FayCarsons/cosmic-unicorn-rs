@@ -4,6 +4,7 @@ use cortex_m::delay::Delay;
 use embedded_hal::digital::OutputPin;
 
 use hal::dma::double_buffer;
+use hal::pac::interrupt;
 use hal::pio::{Buffers, PinDir, Tx};
 use rp_pico::hal;
 use rp_pico::pac::PIO0;
@@ -16,12 +17,13 @@ use hal::gpio::{Error, PinState, Pins};
 use hal::pio::{PIOBuilder, SM0};
 
 use crate::builder::CosmicBuilder;
+use crate::pixel::RGB;
 
 use super::constants::*;
 use super::framebuffer::FrameBuffer;
 use super::pixel;
+
 type BitStream = [u32; BITSTREAM_LENGTH];
-type ByteAlignedBitStream = [u8; BITSTREAM_LENGTH * 4];
 
 type BitstreamTransfer = Transfer<
     Channel<CH0>,
@@ -31,11 +33,10 @@ type BitstreamTransfer = Transfer<
     ReadNext<&'static mut [u32; BITSTREAM_LENGTH]>,
 >;
 
-pub struct CosmicUnicorn {
-    transfer: BitstreamTransfer,
-    bitstream: *mut u8,
-    tx_buf: *mut u8,
-}
+static mut TRANSFER_HANDLER: Option<BitstreamTransfer> = None;
+static mut BUFFERS: Option<(*mut u8, *mut u8)> = None;
+
+pub struct CosmicUnicorn;
 
 // Pins used for PIO+DMA
 //  - 13: column clock (sideset), init 0
@@ -189,65 +190,69 @@ impl CosmicUnicorn {
 
         sm.start();
 
-        Self {
-            transfer,
-            bitstream,
-            tx_buf,
+        unsafe {
+            TRANSFER_HANDLER = Some(transfer);
+            BUFFERS = Some((bitstream, tx_buf));
+
+            Self {}
+        }
+    }
+
+    unsafe fn unsafe_set_pixel(&mut self, x: usize, y: usize, pixel: [u8; 3]) {
+        if let Some((front, _)) = BUFFERS {
+            let [r, g, b] = pixel;
+
+            let mut x = (WIDTH - 1) - x;
+            let mut y = (HEIGHT - 1) - y;
+
+            if y < 16 {
+                x += 32;
+            } else {
+                y -= 16;
+            }
+
+            let (mut r, mut g, mut b) = (GAMMA[r as usize], GAMMA[g as usize], GAMMA[b as usize]);
+
+            // for each row:
+            //   for each bcd frame:
+            //            0: 00111111                           // row pixel count (minus
+            //            one)
+            //      1  - 64: xxxxxbgr, xxxxxbgr, xxxxxbgr, ...  // pixel data
+            //      65 - 67: xxxxxxxx, xxxxxxxx, xxxxxxxx       // dummy bytes to dword
+            //      align
+            //           68: xxxxrrrr                           // row select bits
+            //      69 - 71: tttttttt, tttttttt, tttttttt       // bcd tick count
+            //      (0-65536)
+            //
+            //  .. and back to the start
+
+            let base_offset = y * ROW_BYTES + 2 + x;
+
+            // set the appropriate bits in the separate bcd frames
+            for frame in 0..BCD_FRAME_COUNT {
+                let offset = base_offset + (BCD_FRAME_BYTES * frame);
+
+                let red_bit = r & 0b1;
+                let green_bit = g & 0b1;
+                let blue_bit = b & 0b1;
+
+                let pixel = ((blue_bit << 0) | (green_bit << 1) | (red_bit << 2)) as u8;
+                unsafe {
+                    front.add(offset).write_volatile(pixel);
+                }
+
+                r >>= 1;
+                g >>= 1;
+                b >>= 1;
+            }
         }
     }
 
     pub fn set_pixel<P>(&mut self, x: usize, y: usize, pixel: P)
     where
-        P: super::pixel::RGB,
+        P: RGB,
     {
-        let [r, g, b] = pixel.to_rgb();
-
-        let mut x = (WIDTH - 1) - x;
-        let mut y = (HEIGHT - 1) - y;
-
-        if y < 16 {
-            x += 32;
-        } else {
-            y -= 16;
-        }
-
-        let (mut r, mut g, mut b) = (GAMMA[r as usize], GAMMA[g as usize], GAMMA[b as usize]);
-
-        // for each row:
-        //   for each bcd frame:
-        //            0: 00111111                           // row pixel count (minus
-        //            one)
-        //      1  - 64: xxxxxbgr, xxxxxbgr, xxxxxbgr, ...  // pixel data
-        //      65 - 67: xxxxxxxx, xxxxxxxx, xxxxxxxx       // dummy bytes to dword
-        //      align
-        //           68: xxxxrrrr                           // row select bits
-        //      69 - 71: tttttttt, tttttttt, tttttttt       // bcd tick count
-        //      (0-65536)
-        //
-        //  .. and back to the start
-
-        let base_offset = y * ROW_BYTES + 2 + x;
-
-        // set the appropriate bits in the separate bcd frames
-        for frame in 0..BCD_FRAME_COUNT {
-            let offset = base_offset + (BCD_FRAME_BYTES * frame);
-
-            let red_bit = r & 0b1;
-            let green_bit = g & 0b1;
-            let blue_bit = b & 0b1;
-
-            let pixel = ((blue_bit << 0) | (green_bit << 1) | (red_bit << 2)) as u8;
-            unsafe {
-                self.bitstream
-                    .add(offset)
-                    .cast::<u8>()
-                    .write_volatile(pixel);
-            }
-
-            r >>= 1;
-            g >>= 1;
-            b >>= 1;
-        }
+        unsafe { self.unsafe_set_pixel(x, y, pixel.to_rgb()) }
     }
 
     pub fn update<B>(&mut self, buffer: B)
@@ -263,10 +268,26 @@ impl CosmicUnicorn {
 
                 let r = (col & 0xff0000) >> 16;
                 let g = (col & 0x00ff00) >> 8;
-                let b = (col & 0x0000ff) >> 0;
+                let b = col & 0x0000ff;
 
                 self.set_pixel(x, y, super::pixel::Pixel::new(r as u8, g as u8, b as u8));
                 offset += 1;
+            }
+        }
+    }
+}
+
+#[hal::pac::interrupt]
+unsafe fn DMA_IRQ_0() {
+    if let Some((transfer, bufs)) = TRANSFER_HANDLER.take().zip(BUFFERS.take()) {
+        loop {
+            if transfer.is_done() {
+                let (tx_buf, next) = transfer.wait();
+                let transfer = next.read_next(tx_buf);
+                let bufs = (bufs.1, bufs.0);
+                TRANSFER_HANDLER = Some(transfer);
+                BUFFERS = Some(bufs);
+                break;
             }
         }
     }
