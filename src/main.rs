@@ -5,22 +5,25 @@
 #![no_main]
 #![allow(static_mut_refs)]
 
-use bsp::entry;
 use cortex_m::asm;
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
+use rp_pico::{entry, hal::pio::PIOExt};
 
-use rp_pico as bsp;
-
-use bsp::hal::{
+use rp_pico::hal::dma::DMAExt;
+use rp_pico::hal::{
     clocks::{init_clocks_and_plls, Clock},
+    gpio::Pins,
     pac,
     watchdog::Watchdog,
+    Sio,
 };
 
+mod builder;
+mod constants;
+mod cosmic_unicorn;
 mod framebuffer;
-mod ledmatrix;
 mod pixel;
 
 #[entry]
@@ -44,9 +47,26 @@ fn main() -> ! {
     .ok()
     .unwrap();
 
-    let mut delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
+    let sio = Sio::new(pac.SIO);
+    let pins = Pins::new(
+        pac.IO_BANK0,
+        pac.PADS_BANK0,
+        sio.gpio_bank0,
+        &mut pac.RESETS,
+    );
+    let (pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
+    let dma = pac.DMA.split(&mut pac.RESETS);
+    let delay = cortex_m::delay::Delay::new(core.SYST, clocks.system_clock.freq().to_Hz());
 
-    let led_matrix = ledmatrix::CosmicUnicorn::new(pac, &mut delay);
+    let builder = builder::CosmicBuilder {
+        pins,
+        delay,
+        pio,
+        sm0,
+        dma,
+    };
+
+    let cosmic_unicorn = CosmicUnicorn::new(builder);
 
     loop {
         asm::nop()
