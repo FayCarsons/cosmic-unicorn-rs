@@ -85,7 +85,7 @@ impl CosmicUnicorn {
         }
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
                 self.set_pixel(x, y, pixel::Pixel::splat(0))
@@ -193,12 +193,12 @@ impl CosmicUnicorn {
         unsafe {
             TRANSFER_HANDLER = Some(transfer);
             BUFFERS = Some((bitstream, tx_buf));
-
-            Self {}
         }
+
+        Self
     }
 
-    unsafe fn unsafe_set_pixel(&mut self, x: usize, y: usize, pixel: [u8; 3]) {
+    unsafe fn unsafe_set_pixel(&self, x: usize, y: usize, pixel: [u8; 3]) {
         if let Some((front, _)) = BUFFERS {
             let [r, g, b] = pixel;
 
@@ -236,7 +236,7 @@ impl CosmicUnicorn {
                 let green_bit = g & 0b1;
                 let blue_bit = b & 0b1;
 
-                let pixel = ((blue_bit << 0) | (green_bit << 1) | (red_bit << 2)) as u8;
+                let pixel = (blue_bit | (green_bit << 1) | (red_bit << 2)) as u8;
                 unsafe {
                     front.add(offset).write_volatile(pixel);
                 }
@@ -248,14 +248,14 @@ impl CosmicUnicorn {
         }
     }
 
-    pub fn set_pixel<P>(&mut self, x: usize, y: usize, pixel: P)
+    pub fn set_pixel<P>(&self, x: usize, y: usize, pixel: P)
     where
         P: RGB,
     {
         unsafe { self.unsafe_set_pixel(x, y, pixel.to_rgb()) }
     }
 
-    pub fn update<B>(&mut self, buffer: B)
+    pub fn update<B>(&self, buffer: B)
     where
         B: FrameBuffer,
     {
@@ -269,8 +269,9 @@ impl CosmicUnicorn {
                 let r = (col & 0xff0000) >> 16;
                 let g = (col & 0x00ff00) >> 8;
                 let b = col & 0x0000ff;
-
-                self.set_pixel(x, y, super::pixel::Pixel::new(r as u8, g as u8, b as u8));
+                unsafe {
+                    self.unsafe_set_pixel(x, y, [r as u8, g as u8, b as u8]);
+                }
                 offset += 1;
             }
         }
