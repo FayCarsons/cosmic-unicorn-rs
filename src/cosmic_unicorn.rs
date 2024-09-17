@@ -157,7 +157,7 @@ impl CosmicUnicorn {
             mut delay,
             mut pio,
             sm0,
-            dma,
+            mut dma,
         } = resources;
 
         Self::init_pins(pins, &mut delay).expect("CANNOT INITIALIZE BITSTREAM");
@@ -180,6 +180,8 @@ impl CosmicUnicorn {
             Self::init_bitstream(&mut BITSTREAM);
         }
 
+        dma.ch0.enable_irq0();
+        dma.ch1.enable_irq0();
         let transfer = unsafe {
             double_buffer::Config::new((dma.ch0, dma.ch1), &mut BITSTREAM, tx)
                 .start()
@@ -243,9 +245,9 @@ impl CosmicUnicorn {
                     front.add(offset).write_volatile(pixel);
                 }
 
-                r >>= 1;
-                g >>= 1;
-                b >>= 1;
+                r = r.wrapping_shr(1);
+                g = g.wrapping_shr(1);
+                b = b.wrapping_shr(1);
             }
         }
     }
@@ -282,16 +284,13 @@ impl CosmicUnicorn {
 
 #[hal::pac::interrupt]
 unsafe fn DMA_IRQ_0() {
-    if let Some((transfer, bufs)) = TRANSFER_HANDLER.take().zip(BUFFERS.take()) {
-        loop {
-            if transfer.is_done() {
-                let (tx_buf, next) = transfer.wait();
-                let transfer = next.read_next(tx_buf);
-                let bufs = (bufs.1, bufs.0);
-                TRANSFER_HANDLER = Some(transfer);
-                BUFFERS = Some(bufs);
-                break;
-            }
+    if let Some((mut transfer, bufs)) = TRANSFER_HANDLER.take().zip(BUFFERS.take()) {
+        if transfer.check_irq0() && transfer.is_done() {
+            let (tx_buf, next) = transfer.wait();
+            let transfer = next.read_next(tx_buf);
+            let bufs = (bufs.1, bufs.0);
+            TRANSFER_HANDLER = Some(transfer);
+            BUFFERS = Some(bufs);
         }
     }
 }
