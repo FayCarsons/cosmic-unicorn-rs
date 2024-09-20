@@ -4,7 +4,8 @@
 #![no_std]
 #![no_main]
 #![allow(static_mut_refs)]
-
+#![feature(ptr_to_from_bits)]
+#![feature(strict_provenance)]
 use defmt::*;
 use defmt_rtt as _;
 use panic_probe as _;
@@ -13,6 +14,7 @@ use rp_pico::{entry, hal::pio::PIOExt};
 use rp_pico::hal::dma::DMAExt;
 use rp_pico::hal::{
     clocks::{init_clocks_and_plls, Clock},
+    fugit::{self},
     gpio::Pins,
     pac,
     watchdog::Watchdog,
@@ -24,8 +26,10 @@ mod constants;
 mod cosmic_unicorn;
 mod framebuffer;
 mod pixel;
+mod sketch;
 
 use cosmic_unicorn::CosmicUnicorn;
+use framebuffer::FrameBuffer;
 
 #[entry]
 fn main() -> ! {
@@ -67,7 +71,25 @@ fn main() -> ! {
         dma,
     };
 
-    let cosmic_unicorn = CosmicUnicorn::new(builder);
+    info!("Got Peripherals, initializing LED matrix");
 
-    loop {}
+    watchdog.start(fugit::Duration::<u32, 1, 1000000>::secs(1));
+
+    let cosmic_unicorn = CosmicUnicorn::new(builder);
+    info!("Matrix ready, initializing sketch");
+
+    info!("Enter main loop:");
+    let red = &[pixel::Pixel::new(255, 1, 1); constants::WIDTH * constants::HEIGHT];
+    let blue = &[pixel::Pixel::new(1, 1, 255); constants::WIDTH * constants::HEIGHT];
+    let mut counter = 0usize;
+    let mut is_red = false;
+
+    loop {
+        watchdog.feed();
+        cosmic_unicorn.update(if is_red { red } else { blue });
+        if counter % 300 == 0 {
+            is_red = !is_red;
+        }
+        counter += 1;
+    }
 }

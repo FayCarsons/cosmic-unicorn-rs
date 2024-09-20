@@ -3,41 +3,44 @@ use core::ops::Rem;
 use cortex_m::delay::Delay;
 use embedded_hal::digital::OutputPin;
 
-use hal::dma::double_buffer;
-use hal::pac::interrupt;
-use hal::pio::{Buffers, PinDir, Tx};
+use hal::pio::{Buffers, PinDir};
 use rp_pico::hal;
-use rp_pico::hal::dma::SingleChannel;
+use rp_pico::hal::dma::{Channel, CH0, CH1};
+use rp_pico::hal::pio::{Running, StateMachine, Tx, SM0};
 use rp_pico::pac::PIO0;
 
-use hal::dma::{
-    double_buffer::{ReadNext, Transfer},
-    Channel, CH0, CH1,
-};
-use hal::gpio::{Error, PinState, Pins};
-use hal::pio::{PIOBuilder, SM0};
-
 use crate::builder::CosmicBuilder;
-use crate::pixel::RGB;
+use hal::dma::SingleChannel;
+use hal::gpio::{Error, PinState, Pins};
+use hal::pio::PIOBuilder;
 
 use super::constants::*;
 use super::framebuffer::FrameBuffer;
-use super::pixel;
 
-type BitStream = [u32; BITSTREAM_LENGTH];
+use defmt::info;
 
-type BitstreamTransfer = Transfer<
-    Channel<CH0>,
-    Channel<CH1>,
-    &'static mut [u32; BITSTREAM_LENGTH],
-    Tx<(PIO0, SM0)>,
-    ReadNext<&'static mut [u32; BITSTREAM_LENGTH]>,
->;
+type Buffer = [u8; BITSTREAM_LENGTH];
 
-static mut TRANSFER_HANDLER: Option<BitstreamTransfer> = None;
-static mut BUFFERS: Option<(*mut u8, *mut u8)> = None;
+#[repr(C, align(4))]
+struct BitStream(Buffer);
 
-pub struct CosmicUnicorn;
+impl BitStream {
+    fn get_mut(&mut self) -> &mut Buffer {
+        &mut self.0
+    }
+
+    const fn get(&self) -> Buffer {
+        self.0
+    }
+}
+
+#[allow(unused)]
+pub struct CosmicUnicorn {
+    state_machine: StateMachine<(PIO0, SM0), Running>,
+    tx: Tx<(PIO0, SM0)>,
+    dma_transfer_channel: Channel<CH0>,
+    dma_control_channel: Channel<CH1>,
+}
 
 // Pins used for PIO+DMA
 //  - 13: column clock (sideset), init 0
@@ -50,46 +53,31 @@ pub struct CosmicUnicorn;
 //  - 19: row select bit 2
 //  - 20: row select bit 3
 
-static mut BITSTREAM: BitStream = [0; BITSTREAM_LENGTH];
-static mut TX_BUF: BitStream = [0; BITSTREAM_LENGTH];
-
-const ROW_SELECT_OFFSET: usize = 1;
-const BCD_TICKS_OFFSET: usize = 68;
+static mut BITSTREAM: BitStream = BitStream([0; BITSTREAM_LENGTH]);
 
 impl CosmicUnicorn {
     unsafe fn init_bitstream(bitstream: &mut BitStream) {
-        let byte_aligned = bitstream.as_mut_ptr().cast::<u8>();
-
         for row in 0..16 {
             for frame in 0..BCD_FRAME_COUNT {
-                let offset = row * ROW_BYTES + frame * BCD_FRAME_BYTES;
+                let offset = row * ROW_BYTES + (BCD_FRAME_BYTES * frame);
+                let bitstream_ptr = bitstream.get_mut().as_mut_ptr().add(offset);
 
-                let bitstream_ptr = byte_aligned.add(offset);
                 bitstream_ptr.write(63);
-
-                bitstream_ptr.add(ROW_SELECT_OFFSET).write(row as u8);
+                bitstream_ptr.add(1).write(row as u8);
 
                 let bcd_ticks = 1u32 << frame;
                 bitstream_ptr
-                    .add(BCD_TICKS_OFFSET)
+                    .add(68)
                     .write((bcd_ticks & 0xff).rem(256) as u8);
                 bitstream_ptr
-                    .add(BCD_TICKS_OFFSET + 1)
+                    .add(69)
                     .write((bcd_ticks & 0xff00).wrapping_shr(8).rem(256) as u8);
                 bitstream_ptr
-                    .add(BCD_TICKS_OFFSET + 2)
+                    .add(70)
                     .write((bcd_ticks & 0xff0000).wrapping_shr(16).rem(256) as u8);
                 bitstream_ptr
-                    .add(BCD_TICKS_OFFSET + 3)
+                    .add(71)
                     .write((bcd_ticks & 0xff000000).wrapping_shr(24).rem(256) as u8);
-            }
-        }
-    }
-
-    pub fn clear(&self) {
-        for y in 0..HEIGHT {
-            for x in 0..WIDTH {
-                self.set_pixel(x, y, pixel::Pixel::splat(0))
             }
         }
     }
@@ -107,7 +95,7 @@ impl CosmicUnicorn {
 
         delay.delay_ms(100);
 
-        let reg1 = 0b1111111111001110;
+        let reg1 = 0b1111111111001110u16;
 
         for _ in 0..11 {
             for i in 0..16 {
@@ -157,13 +145,21 @@ impl CosmicUnicorn {
             mut delay,
             mut pio,
             sm0,
-            mut dma,
+            dma,
         } = resources;
 
-        Self::init_pins(pins, &mut delay).expect("CANNOT INITIALIZE BITSTREAM");
+        unsafe {
+            Self::init_bitstream(&mut BITSTREAM);
+        }
+
+        match Self::init_pins(pins, &mut delay) {
+            Ok(_) => info!("Initialized pins and sent init message to led matrix!"),
+            Err(_) => defmt::panic!("CANNOT INITIALIZE BITSTREAM"),
+        };
 
         let program = pio_proc::pio_file!("cosmic_unicorn.pio");
         let installed = pio.install(&program.program).unwrap();
+        info!("Compiled and installed PIO program");
 
         let (mut sm, _, tx) = PIOBuilder::from_installed_program(installed)
             .out_pins(17, 4)
@@ -172,94 +168,119 @@ impl CosmicUnicorn {
             .autopull(true)
             .pull_threshold(32)
             .buffers(Buffers::OnlyTx)
+            .clock_divisor_fixed_point(1, 0)
             .build(sm0);
 
+        sm.set_pins((16..=20).zip(core::iter::repeat(rp_pico::hal::pio::PinState::High)));
         sm.set_pindirs((13..=20).zip(core::iter::repeat(PinDir::Output)));
+        info!("PIO ready");
 
-        unsafe {
-            Self::init_bitstream(&mut BITSTREAM);
+        info!("Bitstream ready");
+
+        info!("PIO state machine started");
+
+        let ch0 = dma.ch0.ch();
+        let ch1 = dma.ch1.ch();
+        ch0.ch_ctrl_trig().write(|reg| unsafe {
+            reg.data_size().size_word();
+            reg.incr_read().set_bit();
+            reg.incr_write().clear_bit();
+            reg.treq_sel().bits(tx.dreq_value());
+            reg.chain_to().bits(1);
+            reg.irq_quiet().set_bit()
+        });
+
+        ch0.ch_read_addr()
+            .write(|reg| unsafe { reg.bits(BITSTREAM.get().as_mut_ptr().addr() as u32) });
+
+        ch0.ch_write_addr()
+            .write(|reg| unsafe { reg.bits(tx.fifo_address().addr() as u32) });
+
+        ch0.ch_trans_count()
+            .write(|reg| unsafe { reg.bits((BITSTREAM_LENGTH / 4) as u32) });
+
+        ch1.ch_ctrl_trig().write(|reg| unsafe {
+            reg.data_size().size_word();
+            reg.incr_read().clear_bit();
+            reg.incr_write().clear_bit();
+            reg.chain_to().bits(0);
+            reg.ring_size().bits(2);
+            reg.ring_sel().set_bit()
+        });
+
+        ch1.ch_read_addr()
+            .write(|reg| unsafe { reg.bits(BITSTREAM.get().as_mut_ptr().addr() as u32) });
+
+        ch1.ch_write_addr()
+            .write(|reg| unsafe { reg.bits(ch0.ch_read_addr().as_ptr().addr() as u32) });
+
+        ch1.ch_trans_count().write(|reg| unsafe { reg.bits(1) });
+
+        let state_machine = sm.start();
+        ch1.ch_ctrl_trig().write(|reg| reg.en().set_bit());
+        ch0.ch_ctrl_trig().write(|reg| reg.en().set_bit());
+        info!("DMA transfer started");
+
+        Self {
+            state_machine,
+            tx,
+            dma_transfer_channel: dma.ch0,
+            dma_control_channel: dma.ch1,
         }
-
-        dma.ch0.enable_irq0();
-        dma.ch1.enable_irq0();
-        let transfer = unsafe {
-            double_buffer::Config::new((dma.ch0, dma.ch1), &mut BITSTREAM, tx)
-                .start()
-                .read_next(&mut TX_BUF)
-        };
-
-        let bitstream = unsafe { BITSTREAM.as_mut_ptr().cast::<u8>() };
-        let tx_buf = unsafe { TX_BUF.as_mut_ptr().cast::<u8>() };
-
-        sm.start();
-
-        unsafe {
-            TRANSFER_HANDLER = Some(transfer);
-            BUFFERS = Some((bitstream, tx_buf));
-            rp_pico::pac::NVIC::unmask(rp_pico::pac::Interrupt::DMA_IRQ_0);
-        }
-
-        Self
     }
 
-    unsafe fn unsafe_set_pixel(&self, x: usize, y: usize, pixel: [u8; 3]) {
-        if let Some((front, _)) = BUFFERS {
-            let [r, g, b] = pixel;
+    fn set_pixel(&self, mut x: usize, mut y: usize, pixel: [u8; 3]) {
+        x = (WIDTH - 1) - x;
+        y = (HEIGHT - 1) - y;
 
-            let mut x = (WIDTH - 1) - x;
-            let mut y = (HEIGHT - 1) - y;
+        if y < 16 {
+            x += 32;
+        } else {
+            y -= 16;
+        }
 
-            if y < 16 {
-                x += 32;
-            } else {
-                y -= 16;
+        // The brightness adjustment has not been implemented, so we ignore that
+        // portion of the original firmware
+        let [mut r, mut g, mut b] = pixel.map(|c| GAMMA[c.wrapping_shr(8) as usize]);
+
+        // for each row:
+        //   for each bcd frame:
+        //            0: 00111111                           // row pixel count (minus
+        //            one)
+        //      1  - 64: xxxxxbgr, xxxxxbgr, xxxxxbgr, ...  // pixel data
+        //      65 - 67: xxxxxxxx, xxxxxxxx, xxxxxxxx       // dummy bytes to dword
+        //      align
+        //           68: xxxxrrrr                           // row select bits
+        //      69 - 71: tttttttt, tttttttt, tttttttt       // bcd tick count
+        //      (0-65536)
+        //
+        //  .. and back to the start
+
+        // set the appropriate bits in the separate bcd frames
+        for frame in 0..BCD_FRAME_COUNT {
+            let offset = y * ROW_BYTES + (BCD_FRAME_BYTES * frame) + 2 + x;
+
+            let red_bit = r & 0b1;
+            let green_bit = g & 0b1;
+            let blue_bit = b & 0b1;
+
+            let pixel = (blue_bit | (green_bit << 1) | (red_bit << 2)) as u8;
+            unsafe {
+                BITSTREAM
+                    .get_mut()
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(offset)
+                    .write(pixel);
             }
 
-            let (mut r, mut g, mut b) = (GAMMA[r as usize], GAMMA[g as usize], GAMMA[b as usize]);
-
-            // for each row:
-            //   for each bcd frame:
-            //            0: 00111111                           // row pixel count (minus
-            //            one)
-            //      1  - 64: xxxxxbgr, xxxxxbgr, xxxxxbgr, ...  // pixel data
-            //      65 - 67: xxxxxxxx, xxxxxxxx, xxxxxxxx       // dummy bytes to dword
-            //      align
-            //           68: xxxxrrrr                           // row select bits
-            //      69 - 71: tttttttt, tttttttt, tttttttt       // bcd tick count
-            //      (0-65536)
-            //
-            //  .. and back to the start
-
-            let base_offset = y * ROW_BYTES + 2 + x;
-
-            // set the appropriate bits in the separate bcd frames
-            for frame in 0..BCD_FRAME_COUNT {
-                let offset = base_offset + (BCD_FRAME_BYTES * frame);
-
-                let red_bit = r & 0b1;
-                let green_bit = g & 0b1;
-                let blue_bit = b & 0b1;
-
-                let pixel = (blue_bit | (green_bit << 1) | (red_bit << 2)) as u8;
-                unsafe {
-                    front.add(offset).write_volatile(pixel);
-                }
-
-                r = r.wrapping_shr(1);
-                g = g.wrapping_shr(1);
-                b = b.wrapping_shr(1);
-            }
+            r >>= 1;
+            g >>= 1;
+            b >>= 1;
         }
     }
 
-    pub fn set_pixel<P>(&self, x: usize, y: usize, pixel: P)
-    where
-        P: RGB,
-    {
-        unsafe { self.unsafe_set_pixel(x, y, pixel.to_rgb()) }
-    }
-
-    pub fn update<B>(&self, buffer: B)
+    pub fn update<B>(&self, buffer: &B)
     where
         B: FrameBuffer,
     {
@@ -273,24 +294,9 @@ impl CosmicUnicorn {
                 let r = (col & 0xff0000) >> 16;
                 let g = (col & 0x00ff00) >> 8;
                 let b = col & 0x0000ff;
-                unsafe {
-                    self.unsafe_set_pixel(x, y, [r as u8, g as u8, b as u8]);
-                }
+                self.set_pixel(x, y, [r as u8, g as u8, b as u8]);
                 offset += 1;
             }
-        }
-    }
-}
-
-#[hal::pac::interrupt]
-unsafe fn DMA_IRQ_0() {
-    if let Some((mut transfer, bufs)) = TRANSFER_HANDLER.take().zip(BUFFERS.take()) {
-        if transfer.check_irq0() && transfer.is_done() {
-            let (tx_buf, next) = transfer.wait();
-            let transfer = next.read_next(tx_buf);
-            let bufs = (bufs.1, bufs.0);
-            TRANSFER_HANDLER = Some(transfer);
-            BUFFERS = Some(bufs);
         }
     }
 }
